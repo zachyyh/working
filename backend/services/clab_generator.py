@@ -617,32 +617,101 @@ def generate_clab_yaml(topology: dict, topology_id: str | None = None) -> str:
                     if ctype == "firewall":
                         # ── VyOS Firewall Native Configuration ──
                         exec_cmds.append("sh -c 'echo \"#!/bin/vbash\" > /tmp/fw_config.sh'")
-                        
+
                         # Wait for the VyOS configuration system to finish booting before sending commands
                         exec_cmds.append("sh -c 'echo \"while ! systemctl is-active vyos-router.service >/dev/null 2>&1; do sleep 2; done; sleep 3\" >> /tmp/fw_config.sh'")
-                        
+
                         exec_cmds.append("sh -c 'echo \"source /opt/vyatta/etc/functions/script-template\" >> /tmp/fw_config.sh'")
-                        exec_cmds.append("sh -c 'echo \"configure\" >> /tmp/fw_config.sh'")
-                        
-                        # Configure Interface IPs
+
+                        # Collect this node's real (iface, ip, prefix) triples
+                        # once so both the config block and the verification
+                        # block below stay in sync.
+                        node_iface_ips: list[tuple[str, str, str]] = []
                         for iface in ifaces:
                             key = (cid, iface)
                             if key in iface_ips:
                                 r_ip, r_pfx = iface_ips[key]
-                                exec_cmds.append(f"sh -c 'echo \"set interfaces ethernet {iface} address {r_ip}/{r_pfx}\" >> /tmp/fw_config.sh'")
-                        
+                                node_iface_ips.append((iface, r_ip, r_pfx))
+
+                        # Wrap the whole configure/delete/set/commit sequence
+                        # in a bash function so it can be retried below.
+                        exec_cmds.append("sh -c 'echo \"apply_ae3gis_config() {\" >> /tmp/fw_config.sh'")
+                        exec_cmds.append("sh -c 'echo \"configure\" >> /tmp/fw_config.sh'")
+
+                        # This image ships with a baked-in default address on
+                        # some interfaces (e.g. eth1=192.168.90.1/24,
+                        # eth2=10.255.255.1/30) that IS committed in VyOS's own
+                        # config.boot. Left in place, it creates a duplicate/
+                        # overlapping route with whatever real interface
+                        # happens to share that default subnet, which trips
+                        # arp_filter and silently kills ARP replies on the
+                        # real link. `delete interfaces ethernet <if> address`
+                        # (deleting only the address value/node) does NOT
+                        # reliably clear it -- verified live that the stale
+                        # address survives that and reappears on commit.
+                        # `delete interfaces ethernet <if>` (the whole
+                        # interface subtree) does reliably clear it, so wipe
+                        # the interface fully before re-setting its real
+                        # address. Interfaces with no baked-in default (every
+                        # firewall's 3rd+ interface) have nothing to delete,
+                        # and `delete` returns non-zero for that -- observed
+                        # live that this silently aborts the whole function
+                        # before it ever reaches `commit` (script-template
+                        # appears to run under errexit), leaving even the
+                        # earlier interfaces' `set` calls uncommitted/
+                        # discarded. `|| true` makes it non-fatal either way.
+                        for iface, r_ip, r_pfx in node_iface_ips:
+                            exec_cmds.append(f"sh -c 'echo \"delete interfaces ethernet {iface} || true\" >> /tmp/fw_config.sh'")
+                            exec_cmds.append(f"sh -c 'echo \"set interfaces ethernet {iface} address {r_ip}/{r_pfx}\" >> /tmp/fw_config.sh'")
+
                         # Configure Static Routing
                         for dest_cidr, via_ip in router_static_routes.get(cid, []):
                             exec_cmds.append(f"sh -c 'echo \"set protocols static route {dest_cidr} next-hop {via_ip}\" >> /tmp/fw_config.sh'")
-                            
+
                         # Commit and Save
                         exec_cmds.append("sh -c 'echo \"commit\" >> /tmp/fw_config.sh'")
                         exec_cmds.append("sh -c 'echo \"save\" >> /tmp/fw_config.sh'")
                         exec_cmds.append("sh -c 'echo \"exit\" >> /tmp/fw_config.sh'")
-                        
-                        # Make executable and run as the vyos user
+                        exec_cmds.append("sh -c 'echo \"}\" >> /tmp/fw_config.sh'")
+
+                        # Verify-and-retry loop: reaching "vyos-router.service
+                        # is active" does not mean the service's own internal
+                        # config-application work is actually finished -- that
+                        # continues asynchronously, and can outlast our fixed
+                        # post-wait sleep under load, silently clobbering our
+                        # config with the image's stale default afterward.
+                        # Rather than guess at a longer fixed delay, actively
+                        # verify each interface ended up with exactly the one
+                        # address we set and re-apply if not. Confirmed live
+                        # that `commit` can silently fail every one of 5
+                        # tries under the load of a full ~30-node concurrent
+                        # deploy (identical config succeeded instantly once
+                        # the system was idle), so this needs real headroom
+                        # -- 10 tries with a longer gap, not 5 with a short
+                        # one.
+                        exec_cmds.append("sh -c 'echo \"for ae3gis_i in 1 2 3 4 5 6 7 8 9 10; do\" >> /tmp/fw_config.sh'")
+                        exec_cmds.append("sh -c 'echo \"apply_ae3gis_config\" >> /tmp/fw_config.sh'")
+                        exec_cmds.append("sh -c 'echo \"ae3gis_ok=1\" >> /tmp/fw_config.sh'")
+                        for iface, r_ip, r_pfx in node_iface_ips:
+                            exec_cmds.append(
+                                f"sh -c 'echo \"ip -4 -o addr show dev {iface} | grep -q \\\"{r_ip}/{r_pfx}\\\" || ae3gis_ok=0\" >> /tmp/fw_config.sh'"
+                            )
+                            exec_cmds.append(
+                                f"sh -c 'echo \"[ \\$(ip -4 -o addr show dev {iface} | wc -l) = 1 ] || ae3gis_ok=0\" >> /tmp/fw_config.sh'"
+                            )
+                        exec_cmds.append("sh -c 'echo \"[ \\$ae3gis_ok = 1 ] && break\" >> /tmp/fw_config.sh'")
+                        exec_cmds.append("sh -c 'echo \"sleep 5\" >> /tmp/fw_config.sh'")
+                        exec_cmds.append("sh -c 'echo \"done\" >> /tmp/fw_config.sh'")
+
+                        # Run as root via vbash directly. There is no `vyos`
+                        # user in this image (`su - vyos` fails outright with
+                        # "user vyos does not exist"), and containerlab's exec
+                        # step doesn't validate that the VyOS commit inside
+                        # actually succeeded -- it only checks the shell exit
+                        # code -- so this was failing completely silently on
+                        # every firewall node, every deploy.
                         exec_cmds.append("chmod +x /tmp/fw_config.sh")
-                        exec_cmds.append("su - vyos -c /tmp/fw_config.sh")
+                        exec_cmds.append("vbash /tmp/fw_config.sh")
                         
                     else:
                         # ── Standard FRR Router Configuration ──

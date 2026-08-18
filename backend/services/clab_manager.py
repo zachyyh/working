@@ -9,6 +9,8 @@ import shlex
 import shutil
 from pathlib import Path
 
+import yaml
+
 from config import CLAB_WORKDIR
 from services import clab_generator
 
@@ -391,6 +393,54 @@ async def pull_images(topology_data: dict) -> None:
             log.info("Pulled image: %s", image)
 
 
+_FIREWALL_IMAGE = "uiaegisv3/fwallperim"
+
+
+async def _reconcile_firewall_configs(path: Path) -> None:
+    """Re-apply firewall (VyOS) config after a successful deploy.
+
+    Confirmed live and repeatedly: the same /tmp/fw_config.sh that each
+    firewall node's own `exec:` sequence writes and runs during deploy
+    converges instantly and reliably when re-run once the deploy has fully
+    finished and the system is idle -- but can fail every one of its
+    in-script retries while still competing with containerlab's own
+    concurrent netlink/veth activity for the other ~30 nodes during the
+    live deploy window. Rather than keep tuning in-script retry counts
+    against a moving target, just re-run it here once, after the fact, in
+    a guaranteed-quiet window. Safe to run again even if the in-deploy
+    attempt already succeeded -- delete+set+commit is idempotent.
+    """
+    try:
+        data = yaml.safe_load(path.read_text())
+    except Exception:
+        log.exception("Could not parse %s to reconcile firewall configs", path)
+        return
+
+    topo_name = (data or {}).get("name")
+    nodes = ((data or {}).get("topology") or {}).get("nodes") or {}
+    if not topo_name or not nodes:
+        return
+
+    firewall_ids = [
+        node_id for node_id, cfg in nodes.items()
+        if isinstance(cfg, dict) and cfg.get("image") == _FIREWALL_IMAGE
+    ]
+    if not firewall_ids:
+        return
+
+    log.info("Reconciling %d firewall node(s) post-deploy: %s", len(firewall_ids), firewall_ids)
+    for node_id in firewall_ids:
+        docker_name = _docker_name(topo_name, node_id)
+        rc, stdout, stderr = await _run(["sudo", "docker", "exec", docker_name, "vbash", "/tmp/fw_config.sh"])
+        if rc != 0:
+            log.warning(
+                "Post-deploy firewall reconcile failed for %s (rc=%s): %s",
+                docker_name, rc, stderr.strip(),
+            )
+        else:
+            log.info("Post-deploy firewall reconcile OK for %s", docker_name)
+
+
 async def deploy(topology_id: str) -> str:
     """Deploy a topology. Returns containerlab stdout."""
     path = _yaml_path(topology_id)
@@ -399,8 +449,9 @@ async def deploy(topology_id: str) -> str:
 
     mgmt_net = management_network_name(topology_id)
     last_stderr = ""
+    max_attempts = 5
 
-    for attempt in range(4):
+    for attempt in range(max_attempts):
         ipv4_subnet = management_ipv4_subnet(topology_id, attempt)
         ipv6_subnet = management_ipv6_subnet(topology_id, attempt)
         deploy_cmd = [
@@ -410,16 +461,41 @@ async def deploy(topology_id: str) -> str:
             "--ipv4-subnet", ipv4_subnet,
             "--ipv6-subnet", ipv6_subnet,
             "--reconfigure",
+            # At full/unbounded concurrency, VyOS `commit` on the firewall
+            # nodes can silently fail under the load of ~30 containers
+            # deploying at once (confirmed live: identical config succeeded
+            # instantly once the system was idle). This is a different
+            # failure mode from the separate "Link not found" link-deploy
+            # bug above (which testing showed --max-workers does NOT fix,
+            # so don't reach for 1 expecting that) -- 4 is a middle ground
+            # that reduces commit-time resource contention without paying
+            # the full serial-deploy time cost.
+            "--max-workers", "4",
         ]
 
         rc, stdout, stderr = await _run(deploy_cmd)
         log.info("containerlab deploy stdout:\n%s", stdout)
         if rc == 0:
+            await _reconcile_firewall_configs(path)
             return stdout
 
         last_stderr = stderr
         overlap_error = "overlap" in stderr.lower() and "subnet" in stderr.lower()
         stale_bridge_error = "Failed to lookup link \"br-" in stderr and "Link not found" in stderr
+        # containerlab 0.78.2 (no newer release exists as of writing) has a
+        # still-open bug in plain `kind: linux` veth link deployment: on this
+        # topology (30 nodes, ~26 links) it non-deterministically errors
+        # "deploy links: Link not found" on one node and cancels the whole
+        # deploy via its shared context, taking out everything else in
+        # flight -- confirmed via testing that this is NOT a concurrency/
+        # timing race (neither --max-workers 4 nor fully serial
+        # --max-workers 1 eliminated it, and failures occur too fast, before
+        # most nodes even finish being created, to be explained by slow
+        # image startup). Since destroy + redeploy has empirically succeeded
+        # on retry most of the time, self-heal by destroying the partially
+        # up lab and trying again rather than surfacing a half-broken
+        # topology to the user.
+        link_not_found_error = "Link not found" in stderr and not stale_bridge_error
 
         # Self-heal stale docker network metadata that references a missing
         # bridge device (e.g., `Failed to lookup link "br-xxxx": Link not found`).
@@ -435,7 +511,7 @@ async def deploy(topology_id: str) -> str:
                 log.warning("docker network rm stderr:\n%s", rm_stderr)
             continue
 
-        if overlap_error and attempt < 3:
+        if overlap_error and attempt < max_attempts - 1:
             log.warning(
                 "Management subnet overlap for topology %s using %s/%s. "
                 "Retrying with a different deterministic subnet.",
@@ -443,6 +519,22 @@ async def deploy(topology_id: str) -> str:
                 ipv4_subnet,
                 ipv6_subnet,
             )
+            continue
+
+        if link_not_found_error and attempt < max_attempts - 1:
+            log.warning(
+                "containerlab hit its known 'Link not found' link-deploy bug "
+                "for topology %s (attempt %d/%d). Destroying the partially "
+                "deployed lab and retrying.",
+                topology_id, attempt + 1, max_attempts,
+            )
+            try:
+                await destroy(topology_id)
+            except Exception:
+                log.exception(
+                    "Cleanup destroy failed after a 'Link not found' deploy "
+                    "error; attempting redeploy anyway."
+                )
             continue
 
         break
