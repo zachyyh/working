@@ -4,6 +4,7 @@ import { TopologyDispatchContext } from '../store/TopologyContext';
 import { AuthContext } from '../store/AuthContext';
 import { ContainerDialog } from './dialogs/ContainerDialog';
 import { ConfirmDialog } from './dialogs/ConfirmDialog';
+import { ContainerConfigDialog } from './dialogs/ContainerConfigDialog';
 import { prewarmCapture } from '../api/client';
 import { typeDisplayNames } from './ContainerAspects';
 import type { ContainerType } from './ContainerAspects';
@@ -47,6 +48,7 @@ export function NodeInfoPanel({
   const auth = useContext(AuthContext);
   const [editOpen, setEditOpen] = useState(false);
   const [deleteOpen, setDeleteOpen] = useState(false);
+  const [configOpen, setConfigOpen] = useState(false);
 
   // Pre-warm the Wireshark sidecar as soon as a deployed container is selected,
   // so it's ready by the time the user clicks "Capture Traffic".
@@ -88,6 +90,19 @@ export function NodeInfoPanel({
     });
     setDeleteOpen(false);
     onClose();
+  };
+
+  const handleConfigSave = (configData: Record<string, any>) => {
+    if (!container || !siteId || !subnetId) return;
+    dispatch({
+      type: 'UPDATE_CONTAINER',
+      payload: {
+        siteId,
+        subnetId,
+        containerId: container.id,
+        updates: { config: configData }, // Automatically merges into the container!
+      },
+    });
   };
 
   return (
@@ -177,6 +192,22 @@ export function NodeInfoPanel({
                 ))}
               </>
             )}
+            
+            {/* Displaying Current Config in the Panel (Optional but helpful) */}
+            {container.config && Object.keys(container.config).length > 0 && (
+              <>
+                <div style={{ height: '1px', background: '#1e1e2e', margin: '16px 0' }} />
+                <div className="info-field">
+                  <div className="info-label">Configuration</div>
+                </div>
+                {Object.entries(container.config).map(([key, value]) => (
+                  <div className="info-field" key={key}>
+                    <div className="info-label">{key}</div>
+                    <div className="info-value">{String(value)}</div>
+                  </div>
+                ))}
+              </>
+            )}
           </div>
 
           <div className="info-panel-actions">
@@ -210,15 +241,17 @@ export function NodeInfoPanel({
               </button>
             )}
             {!readOnly && (
-              <div style={{ display: 'flex', gap: '8px', marginTop: '8px' }}>
+              <>
+                {/* <-- ADDED CONFIGURE BUTTON HERE --> */}
                 <button
-                  onClick={() => setEditOpen(true)}
+                  onClick={() => setConfigOpen(true)}
                   style={{
-                    flex: 1,
+                    width: '100%',
+                    marginTop: '16px',
                     padding: '12px 18px',
-                    background: 'rgba(0, 212, 255, 0.08)',
-                    border: '1px solid var(--neon-cyan)',
-                    color: 'var(--neon-cyan)',
+                    background: 'rgba(255, 193, 7, 0.08)',
+                    border: '1px solid var(--neon-yellow, #ffc107)',
+                    color: 'var(--neon-yellow, #ffc107)',
                     fontFamily: 'var(--font-mono)',
                     fontSize: '16px',
                     cursor: 'pointer',
@@ -227,27 +260,47 @@ export function NodeInfoPanel({
                     letterSpacing: '1px',
                   }}
                 >
-                  Edit
+                  ⚙️ Configure Node
                 </button>
-                <button
-                  onClick={() => setDeleteOpen(true)}
-                  style={{
-                    flex: 1,
-                    padding: '12px 18px',
-                    background: 'rgba(255, 51, 68, 0.08)',
-                    border: '1px solid var(--neon-red)',
-                    color: 'var(--neon-red)',
-                    fontFamily: 'var(--font-mono)',
-                    fontSize: '16px',
-                    cursor: 'pointer',
-                    borderRadius: '4px',
-                    textTransform: 'uppercase',
-                    letterSpacing: '1px',
-                  }}
-                >
-                  Delete
-                </button>
-              </div>
+                <div style={{ display: 'flex', gap: '8px', marginTop: '8px' }}>
+                  <button
+                    onClick={() => setEditOpen(true)}
+                    style={{
+                      flex: 1,
+                      padding: '12px 18px',
+                      background: 'rgba(0, 212, 255, 0.08)',
+                      border: '1px solid var(--neon-cyan)',
+                      color: 'var(--neon-cyan)',
+                      fontFamily: 'var(--font-mono)',
+                      fontSize: '16px',
+                      cursor: 'pointer',
+                      borderRadius: '4px',
+                      textTransform: 'uppercase',
+                      letterSpacing: '1px',
+                    }}
+                  >
+                    Edit
+                  </button>
+                  <button
+                    onClick={() => setDeleteOpen(true)}
+                    style={{
+                      flex: 1,
+                      padding: '12px 18px',
+                      background: 'rgba(255, 51, 68, 0.08)',
+                      border: '1px solid var(--neon-red)',
+                      color: 'var(--neon-red)',
+                      fontFamily: 'var(--font-mono)',
+                      fontSize: '16px',
+                      cursor: 'pointer',
+                      borderRadius: '4px',
+                      textTransform: 'uppercase',
+                      letterSpacing: '1px',
+                    }}
+                  >
+                    Delete
+                  </button>
+                </div>
+              </>
             )}
           </div>
 
@@ -266,6 +319,14 @@ export function NodeInfoPanel({
                 message={`Delete "${container.name}"? All connections will be removed.`}
                 onConfirm={handleDelete}
                 onCancel={() => setDeleteOpen(false)}
+              />
+
+              {/* <-- ADDED CONFIG DIALOG MOUNT HERE --> */}
+              <ContainerConfigDialog
+                open={configOpen}
+                onClose={() => setConfigOpen(false)}
+                container={container}
+                onSave={handleConfigSave}
               />
             </>
           )}

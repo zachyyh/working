@@ -9,8 +9,6 @@ RUN npm ci
 
 COPY . .
 
-RUN python3 src/components/dynamicFrontendGenerator.py
-
 RUN npm run build
 
 FROM nginx:alpine

@@ -52,4 +52,6 @@ PYEOF
     fi
 fi
 
+python3 frontend/src/components/dynamicFrontendGenerator.py
+
 docker compose up --build

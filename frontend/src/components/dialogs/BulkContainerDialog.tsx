@@ -1,9 +1,8 @@
 import { useState, useCallback, useMemo } from 'react';
 import { Dialog } from '../ui/Dialog';
 import { FormField } from '../ui/FormField';
-import { SelectField } from '../ui/SelectField';
 import { isValidIp, isIpInCidr, getAvailableIps, getSubnetCapacity } from '../../utils/validation';
-import { typeOptions } from '../ContainerAspects'
+import { typeOptions, menuHierarchy, typeDisplayNames } from '../ContainerAspects';
 import type { ContainerType } from '../ContainerAspects';
 
 const typeLabel = Object.fromEntries(typeOptions.map(o => [o.value, o.label])) as Record<ContainerType, string>;
@@ -12,13 +11,14 @@ interface BulkEntry {
   key: number;
   name: string;
   type: ContainerType;
+  image: string;
   ip: string;
 }
 
 interface BulkContainerDialogProps {
   open: boolean;
   onClose: () => void;
-  onSubmit: (entries: { name: string; type: ContainerType; ip: string }[]) => void;
+  onSubmit: (entries: { name: string; type: ContainerType; image: string; ip: string }[]) => void;
   subnetCidr: string;
   takenIps: string[];
   existingNames?: string[];
@@ -31,11 +31,17 @@ function BulkContainerDialogInner({ onClose, onSubmit, subnetCidr, takenIps, exi
   const [prefix, setPrefix] = useState(typeLabel['workstation']);
   const [prefixIsAuto, setPrefixIsAuto] = useState(true);
   const [genType, setGenType] = useState<ContainerType>('workstation');
+  const [genImage, setGenImage] = useState<string>('');
   const [count, setCount] = useState('5');
   const [genError, setGenError] = useState('');
 
   // Table entries
   const [entries, setEntries] = useState<BulkEntry[]>([]);
+
+  // Menu states for inline flyouts
+  const [activeMenu, setActiveMenu] = useState<'gen' | number | null>(null);
+  const [activeCategory, setActiveCategory] = useState<string | null>(null);
+  const [activeTypeMenu, setActiveTypeMenu] = useState<string | null>(null);
 
   // Subnet capacity
   const totalCapacity = useMemo(() => getSubnetCapacity(subnetCidr), [subnetCidr]);
@@ -64,8 +70,6 @@ function BulkContainerDialogInner({ onClose, onSubmit, subnetCidr, takenIps, exi
     } else {
       setGenError('');
     }
-    // Find the highest existing number for this prefix across existing containers
-    // and any entries already queued in this dialog, so numbering continues correctly.
     const escaped = prefix.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
     const pattern = new RegExp(`^${escaped}\\s*(\\d+)$`, 'i');
     let max = 0;
@@ -78,13 +82,14 @@ function BulkContainerDialogInner({ onClose, onSubmit, subnetCidr, takenIps, exi
       key: nextKey++,
       name: `${prefix} ${max + i + 1}`,
       type: genType,
+      image: genImage,
       ip,
     }));
     setEntries(prev => [...prev, ...generated]);
-  }, [prefix, genType, count, subnetCidr, takenIps, entries]);
+  }, [prefix, genType, genImage, count, subnetCidr, takenIps, entries, existingNames]);
 
   const handleAddRow = useCallback(() => {
-    setEntries(prev => [...prev, { key: nextKey++, name: '', type: 'workstation', ip: '' }]);
+    setEntries(prev => [...prev, { key: nextKey++, name: '', type: 'workstation', image: '', ip: '' }]);
   }, []);
 
   const updateEntry = useCallback((key: number, field: keyof BulkEntry, value: string) => {
@@ -103,7 +108,6 @@ function BulkContainerDialogInner({ onClose, onSubmit, subnetCidr, takenIps, exi
     if (!entry.name.trim() || !isValidIp(entry.ip)) return false;
     if (!isIpInCidr(entry.ip, subnetCidr)) return false;
     if (takenIps.includes(entry.ip.trim())) return false;
-    // Check for intra-table duplicates — only the first occurrence is valid
     const firstWithIp = entries.find(e => e.ip.trim() === entry.ip.trim());
     if (firstWithIp && firstWithIp.key !== entry.key) return false;
     return true;
@@ -114,16 +118,15 @@ function BulkContainerDialogInner({ onClose, onSubmit, subnetCidr, takenIps, exi
     if (!isValidIp(entry.ip)) return 'Invalid IP';
     if (!isIpInCidr(entry.ip, subnetCidr)) return 'Outside subnet';
     if (takenIps.includes(entry.ip.trim())) return 'Already taken';
-    // Check for duplicates within the entries themselves
     const dupes = entries.filter(e => e.key !== entry.key && e.ip.trim() === entry.ip.trim());
     if (dupes.length > 0) return 'Duplicate';
     return '';
   }, [subnetCidr, takenIps, entries]);
 
-  const handleSubmit = () => {
+const handleSubmit = () => {
     const valid = entries.filter(isEntryValid);
     if (valid.length === 0) return;
-    // Final dedup safety net — keep first occurrence of each IP
+    
     const seen = new Set<string>();
     const deduped = valid.filter(e => {
       const ip = e.ip.trim();
@@ -131,8 +134,41 @@ function BulkContainerDialogInner({ onClose, onSubmit, subnetCidr, takenIps, exi
       seen.add(ip);
       return true;
     });
+    
     if (deduped.length === 0) return;
-    onSubmit(deduped.map(e => ({ name: e.name.trim(), type: e.type, ip: e.ip.trim() })));
+
+    // Format the image string and apply defaults for every row
+    const finalEntries = deduped.map(e => {
+      // 1. Extract the tag if somehow there is a string with spaces
+      let extractedTag = e.image.trim() ? e.image.trim().split(/\s+/).pop() || '' : '';
+
+      // 2. If the tag is empty (user didn't open the menu for this row/generator),
+      // auto-assign the default tag from menuHierarchy based on the row's type.
+      if (!extractedTag) {
+        for (const category of Object.values(menuHierarchy)) {
+          // @ts-expect-error - category indexing is safe here based on how menuHierarchy is built
+          if (category[e.type] && category[e.type].length > 0) {
+            // @ts-expect-error
+            extractedTag = category[e.type][0]; 
+            break;
+          }
+        }
+        // Absolute fallback
+        if (!extractedTag) {
+          extractedTag = 'latest';
+        }
+      }
+
+      // Return the cleaned up row
+      return { 
+        name: e.name.trim(), 
+        type: e.type, 
+        image: extractedTag, 
+        ip: e.ip.trim() 
+      };
+    });
+
+    onSubmit(finalEntries);
     onClose();
   };
 
@@ -148,12 +184,6 @@ function BulkContainerDialogInner({ onClose, onSubmit, subnetCidr, takenIps, exi
     fontSize: '13px',
     outline: 'none',
     width: '100%',
-  };
-
-  const selectStyle: React.CSSProperties = {
-    ...inputStyle,
-    appearance: 'none' as const,
-    cursor: 'pointer',
   };
 
   return (
@@ -193,14 +223,141 @@ function BulkContainerDialogInner({ onClose, onSubmit, subnetCidr, takenIps, exi
             </div>
           </div>
         </div>
-        <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '8px' }}>
+        <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 0.5fr', gap: '8px', alignItems: 'end' }}>
           <FormField label="Name prefix" value={prefix} onChange={v => { setPrefix(v); setPrefixIsAuto(false); }} placeholder="e.g. Server" />
-          <SelectField label="Type" value={genType} onChange={v => {
-            const t = v as ContainerType;
-            setGenType(t);
-            if (prefixIsAuto) setPrefix(typeLabel[t]);
-          }} options={typeOptions} />
-          <FormField label="Count" value={count} onChange={v => { setCount(v); setGenError(''); }} placeholder="1–500" type="number" />
+          
+          <div style={{ position: 'relative', paddingBottom: '16px' }}>
+            <label style={{
+              display: 'block',
+              fontFamily: "var(--font-mono)",
+              fontSize: '13px',
+              color: 'var(--text-dim)',
+              textTransform: 'uppercase',
+              letterSpacing: '1px',
+              marginBottom: '6px',
+            }}>
+              Template
+            </label>
+            <div
+              onClick={() => setActiveMenu(activeMenu === 'gen' ? null : 'gen')}
+              style={{
+                width: '100%',
+                boxSizing: 'border-box',
+                padding: '8px 12px',
+                background: 'var(--bg-primary)',
+                border: '1px solid var(--border-color)',
+                borderRadius: '4px',
+                color: genType ? 'var(--text-primary)' : 'var(--text-dim)',
+                fontFamily: "var(--font-mono)",
+                fontSize: '13px',
+                cursor: 'pointer',
+                display: 'flex',
+                justifyContent: 'space-between',
+                alignItems: 'center'
+              }}
+            >
+              <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                {genType && genImage ? `${typeDisplayNames[genType]} (${genImage})` : genType ? typeDisplayNames[genType] : 'Select...'}
+              </span>
+              <span style={{ fontSize: '10px', marginLeft: '6px' }}>▼</span>
+            </div>
+
+            {activeMenu === 'gen' && (
+              <ul style={{
+                position: 'absolute',
+                top: 'calc(100% - 16px)',
+                left: 0,
+                width: '100%',
+                minWidth: '220px',
+                background: 'var(--bg-primary)',
+                border: '1px solid var(--border-color)',
+                borderRadius: '0 0 4px 4px',
+                margin: 0,
+                padding: 0,
+                listStyle: 'none',
+                zIndex: 100,
+                fontFamily: "var(--font-mono)",
+                fontSize: '13px',
+                maxHeight: '250px',
+                overflowY: 'auto'
+              }}>
+                {Object.keys(menuHierarchy).map((category) => (
+                  <li key={category} style={{ position: 'relative' }}>
+                    <div 
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        if (activeCategory === category) {
+                          setActiveCategory(null);
+                          setActiveTypeMenu(null);
+                        } else {
+                          setActiveCategory(category);
+                          setActiveTypeMenu(null);
+                        }
+                      }}
+                      style={{
+                        padding: '8px 12px',
+                        color: activeCategory === category ? 'var(--neon-cyan)' : 'var(--text-primary)',
+                        background: activeCategory === category ? 'rgba(0, 212, 255, 0.08)' : 'transparent',
+                        cursor: 'pointer',
+                        display: 'flex',
+                        justifyContent: 'space-between',
+                        textTransform: 'capitalize' 
+                      }}
+                    >
+                      {category}
+                      <span style={{ fontSize: '12px', transform: activeCategory === category ? 'rotate(90deg)' : 'rotate(0deg)' }}>▶</span>
+                    </div>
+
+                    {activeCategory === category && (
+                      <ul style={{ background: 'rgba(0,0,0,0.15)', margin: 0, padding: 0, listStyle: 'none', borderTop: '1px solid var(--border-color)' }}>
+                        {Object.keys(menuHierarchy[category]).map((t) => (
+                          <li key={t} style={{ position: 'relative' }}>
+                            <div 
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                setActiveTypeMenu(activeTypeMenu === t ? null : t);
+                              }}
+                              style={{ padding: '8px 12px 8px 24px', color: activeTypeMenu === t ? 'var(--neon-cyan)' : 'var(--text-primary)', cursor: 'pointer', display: 'flex', justifyContent: 'space-between' }}
+                            >
+                              {typeDisplayNames[t as ContainerType]}
+                              <span style={{ fontSize: '12px', transform: activeTypeMenu === t ? 'rotate(90deg)' : 'rotate(0deg)' }}>▶</span>
+                            </div>
+
+                            {activeTypeMenu === t && (
+                              <ul style={{ background: 'rgba(0,0,0,0.25)', margin: 0, padding: 0, listStyle: 'none', borderTop: '1px solid var(--border-color)' }}>
+                                {menuHierarchy[category][t as ContainerType]?.map((tag) => (
+                                  <li 
+                                    key={tag}
+                                    onClick={(e) => {
+                                      e.stopPropagation();
+                                      const selectedType = t as ContainerType;
+                                      setGenType(selectedType);
+                                      setGenImage(tag); 
+                                      setActiveMenu(null);
+                                      if (prefixIsAuto) setPrefix(typeLabel[selectedType]);
+                                    }}
+                                    style={{ padding: '8px 12px 8px 36px', color: 'var(--text-primary)', cursor: 'pointer', borderBottom: '1px solid rgba(255,255,255,0.05)' }}
+                                    onMouseEnter={(e) => { e.currentTarget.style.color = 'var(--neon-green)'; }}
+                                    onMouseLeave={(e) => { e.currentTarget.style.color = 'var(--text-primary)'; }}
+                                  >
+                                    {tag}
+                                  </li>
+                                ))}
+                              </ul>
+                            )}
+                          </li>
+                        ))}
+                      </ul>
+                    )}
+                  </li>
+                ))}
+              </ul>
+            )}
+          </div>
+
+          <div style={{ paddingBottom: '16px' }}>
+            <FormField label="Count" value={count} onChange={v => { setCount(v); setGenError(''); }} placeholder="1–500" type="number" />
+          </div>
         </div>
         {genError && (
           <div style={{ color: 'var(--neon-red)', fontFamily: 'var(--font-mono)', fontSize: '13px', marginTop: '6px' }}>
@@ -246,15 +403,7 @@ function BulkContainerDialogInner({ onClose, onSubmit, subnetCidr, takenIps, exi
             <button
               type="button"
               onClick={clearAll}
-              style={{
-                background: 'none',
-                border: 'none',
-                color: 'var(--neon-red)',
-                fontFamily: 'var(--font-mono)',
-                fontSize: '12px',
-                cursor: 'pointer',
-                textTransform: 'uppercase',
-              }}
+              style={{ background: 'none', border: 'none', color: 'var(--neon-red)', fontFamily: 'var(--font-mono)', fontSize: '12px', cursor: 'pointer', textTransform: 'uppercase' }}
             >
               Clear all
             </button>
@@ -262,15 +411,7 @@ function BulkContainerDialogInner({ onClose, onSubmit, subnetCidr, takenIps, exi
           <button
             type="button"
             onClick={handleAddRow}
-            style={{
-              background: 'none',
-              border: 'none',
-              color: 'var(--neon-cyan)',
-              fontFamily: 'var(--font-mono)',
-              fontSize: '12px',
-              cursor: 'pointer',
-              textTransform: 'uppercase',
-            }}
+            style={{ background: 'none', border: 'none', color: 'var(--neon-cyan)', fontFamily: 'var(--font-mono)', fontSize: '12px', cursor: 'pointer', textTransform: 'uppercase' }}
           >
             + Add row
           </button>
@@ -279,15 +420,16 @@ function BulkContainerDialogInner({ onClose, onSubmit, subnetCidr, takenIps, exi
 
       {entries.length > 0 ? (
         <div style={{
-          maxHeight: '280px',
+          maxHeight: '320px',
           overflowY: 'auto',
           border: '1px solid var(--border-color)',
           borderRadius: '4px',
+          paddingBottom: '80px', // Extra space so bottom flyouts don't get clipped by the container
         }}>
           {/* Table header */}
           <div style={{
             display: 'grid',
-            gridTemplateColumns: '2fr 1.5fr 1.5fr 28px',
+            gridTemplateColumns: '1.5fr 2fr 1.5fr 28px',
             gap: '6px',
             padding: '6px 8px',
             background: 'rgba(0, 212, 255, 0.05)',
@@ -299,9 +441,10 @@ function BulkContainerDialogInner({ onClose, onSubmit, subnetCidr, takenIps, exi
             letterSpacing: '1px',
             position: 'sticky',
             top: 0,
+            zIndex: 10,
           }}>
             <span>Name</span>
-            <span>Type</span>
+            <span>Template</span>
             <span>IP</span>
             <span />
           </div>
@@ -312,7 +455,7 @@ function BulkContainerDialogInner({ onClose, onSubmit, subnetCidr, takenIps, exi
               key={entry.key}
               style={{
                 display: 'grid',
-                gridTemplateColumns: '2fr 1.5fr 1.5fr 28px',
+                gridTemplateColumns: '1.5fr 2fr 1.5fr 28px',
                 gap: '6px',
                 padding: '4px 8px',
                 alignItems: 'center',
@@ -322,44 +465,141 @@ function BulkContainerDialogInner({ onClose, onSubmit, subnetCidr, takenIps, exi
               <input
                 value={entry.name}
                 onChange={e => updateEntry(entry.key, 'name', e.target.value)}
-                style={{
-                  ...inputStyle,
-                  borderColor: !entry.name.trim() ? 'var(--neon-red)' : 'var(--border-color)',
-                }}
+                style={{ ...inputStyle, borderColor: !entry.name.trim() ? 'var(--neon-red)' : 'var(--border-color)' }}
                 placeholder="Name"
               />
-              <select
-                value={entry.type}
-                onChange={e => updateEntry(entry.key, 'type', e.target.value)}
-                style={selectStyle}
-              >
-                {typeOptions.map(o => (
-                  <option key={o.value} value={o.value}>{o.label}</option>
-                ))}
-              </select>
+
+              {/* Inline template flyout for the row */}
+              <div style={{ position: 'relative', width: '100%' }}>
+                <div
+                  onClick={() => setActiveMenu(activeMenu === entry.key ? null : entry.key)}
+                  style={{
+                    width: '100%',
+                    boxSizing: 'border-box',
+                    padding: '4px 6px',
+                    background: 'var(--bg-primary)',
+                    border: '1px solid var(--border-color)',
+                    borderRadius: '3px',
+                    color: entry.type ? 'var(--text-primary)' : 'var(--text-dim)',
+                    fontFamily: "var(--font-mono)",
+                    fontSize: '13px',
+                    cursor: 'pointer',
+                    display: 'flex',
+                    justifyContent: 'space-between',
+                    alignItems: 'center'
+                  }}
+                >
+                  <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                    {entry.type && entry.image ? `${typeDisplayNames[entry.type]} (${entry.image})` : entry.type ? typeDisplayNames[entry.type] : 'Select...'}
+                  </span>
+                  <span style={{ fontSize: '10px', marginLeft: '6px' }}>▼</span>
+                </div>
+
+                {activeMenu === entry.key && (
+                  <ul style={{
+                    position: 'absolute',
+                    top: '100%',
+                    left: 0,
+                    width: '100%',
+                    minWidth: '220px',
+                    background: 'var(--bg-primary)',
+                    border: '1px solid var(--border-color)',
+                    borderTop: 'none',
+                    borderRadius: '0 0 4px 4px',
+                    margin: 0,
+                    padding: 0,
+                    listStyle: 'none',
+                    zIndex: 100,
+                    fontFamily: "var(--font-mono)",
+                    fontSize: '13px',
+                    maxHeight: '250px',
+                    overflowY: 'auto',
+                    boxShadow: '0 4px 12px rgba(0,0,0,0.5)'
+                  }}>
+                    {Object.keys(menuHierarchy).map((category) => (
+                      <li key={category} style={{ position: 'relative' }}>
+                        <div 
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            if (activeCategory === category) {
+                              setActiveCategory(null);
+                              setActiveTypeMenu(null);
+                            } else {
+                              setActiveCategory(category);
+                              setActiveTypeMenu(null);
+                            }
+                          }}
+                          style={{
+                            padding: '8px 12px',
+                            color: activeCategory === category ? 'var(--neon-cyan)' : 'var(--text-primary)',
+                            background: activeCategory === category ? 'rgba(0, 212, 255, 0.08)' : 'transparent',
+                            cursor: 'pointer',
+                            display: 'flex',
+                            justifyContent: 'space-between',
+                            textTransform: 'capitalize' 
+                          }}
+                        >
+                          {category}
+                          <span style={{ fontSize: '12px', transform: activeCategory === category ? 'rotate(90deg)' : 'rotate(0deg)' }}>▶</span>
+                        </div>
+
+                        {activeCategory === category && (
+                          <ul style={{ background: 'rgba(0,0,0,0.15)', margin: 0, padding: 0, listStyle: 'none', borderTop: '1px solid var(--border-color)' }}>
+                            {Object.keys(menuHierarchy[category]).map((t) => (
+                              <li key={t} style={{ position: 'relative' }}>
+                                <div 
+                                  onClick={(e) => {
+                                    e.stopPropagation();
+                                    setActiveTypeMenu(activeTypeMenu === t ? null : t);
+                                  }}
+                                  style={{ padding: '8px 12px 8px 24px', color: activeTypeMenu === t ? 'var(--neon-cyan)' : 'var(--text-primary)', cursor: 'pointer', display: 'flex', justifyContent: 'space-between' }}
+                                >
+                                  {typeDisplayNames[t as ContainerType]}
+                                  <span style={{ fontSize: '12px', transform: activeTypeMenu === t ? 'rotate(90deg)' : 'rotate(0deg)' }}>▶</span>
+                                </div>
+
+                                {activeTypeMenu === t && (
+                                  <ul style={{ background: 'rgba(0,0,0,0.25)', margin: 0, padding: 0, listStyle: 'none', borderTop: '1px solid var(--border-color)' }}>
+                                    {menuHierarchy[category][t as ContainerType]?.map((tag) => (
+                                      <li 
+                                        key={tag}
+                                        onClick={(e) => {
+                                          e.stopPropagation();
+                                          const selectedType = t as ContainerType;
+                                          updateEntry(entry.key, 'type', selectedType);
+                                          updateEntry(entry.key, 'image', tag);
+                                          setActiveMenu(null);
+                                        }}
+                                        style={{ padding: '8px 12px 8px 36px', color: 'var(--text-primary)', cursor: 'pointer', borderBottom: '1px solid rgba(255,255,255,0.05)' }}
+                                        onMouseEnter={(e) => { e.currentTarget.style.color = 'var(--neon-green)'; }}
+                                        onMouseLeave={(e) => { e.currentTarget.style.color = 'var(--text-primary)'; }}
+                                      >
+                                        {tag}
+                                      </li>
+                                    ))}
+                                  </ul>
+                                )}
+                              </li>
+                            ))}
+                          </ul>
+                        )}
+                      </li>
+                    ))}
+                  </ul>
+                )}
+              </div>
+
               <input
                 value={entry.ip}
                 onChange={e => updateEntry(entry.key, 'ip', e.target.value)}
                 title={getIpError(entry) || undefined}
-                style={{
-                  ...inputStyle,
-                  borderColor: getIpError(entry) ? 'var(--neon-red)' : 'var(--border-color)',
-                }}
+                style={{ ...inputStyle, borderColor: getIpError(entry) ? 'var(--neon-red)' : 'var(--border-color)' }}
                 placeholder="IP"
               />
               <button
                 type="button"
                 onClick={() => removeEntry(entry.key)}
-                style={{
-                  background: 'none',
-                  border: 'none',
-                  color: 'var(--neon-red)',
-                  cursor: 'pointer',
-                  fontFamily: 'var(--font-mono)',
-                  fontSize: '13px',
-                  padding: '0',
-                  lineHeight: 1,
-                }}
+                style={{ background: 'none', border: 'none', color: 'var(--neon-red)', cursor: 'pointer', fontFamily: 'var(--font-mono)', fontSize: '13px', padding: '0', lineHeight: 1 }}
               >
                 x
               </button>
@@ -385,16 +625,7 @@ function BulkContainerDialogInner({ onClose, onSubmit, subnetCidr, takenIps, exi
         <button
           type="button"
           onClick={onClose}
-          style={{
-            padding: '8px 16px',
-            background: 'none',
-            border: '1px solid var(--border-color)',
-            borderRadius: '4px',
-            color: 'var(--text-secondary)',
-            fontFamily: 'var(--font-mono)',
-            fontSize: '13px',
-            cursor: 'pointer',
-          }}
+          style={{ padding: '8px 16px', background: 'none', border: '1px solid var(--border-color)', borderRadius: '4px', color: 'var(--text-secondary)', fontFamily: 'var(--font-mono)', fontSize: '13px', cursor: 'pointer' }}
         >
           Cancel
         </button>
@@ -423,7 +654,7 @@ function BulkContainerDialogInner({ onClose, onSubmit, subnetCidr, takenIps, exi
 
 export function BulkContainerDialog({ open, onClose, onSubmit, subnetCidr, takenIps, existingNames }: BulkContainerDialogProps) {
   return (
-    <Dialog title="Bulk Add Containers" open={open} onClose={onClose} width={620}>
+    <Dialog title="Bulk Add Containers" open={open} onClose={onClose} width={720}>
       {open && <BulkContainerDialogInner onClose={onClose} onSubmit={onSubmit} subnetCidr={subnetCidr} takenIps={takenIps} existingNames={existingNames} />}
     </Dialog>
   );

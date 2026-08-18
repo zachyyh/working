@@ -9,6 +9,7 @@ export interface Container {
   kind?: string;
   image?: string;
   status?: 'running' | 'stopped' | 'paused';
+  config?: Record<string, any>;
   metadata?: Record<string, string>;
   persistencePaths?: string[];
 }

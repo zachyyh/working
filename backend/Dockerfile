@@ -15,6 +15,8 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
+RUN ansible-galaxy collection install vyos.vyos community.docker community.general community.postgresql ansible.posix
+
 COPY . .
 
 # Ensure workdirs exist

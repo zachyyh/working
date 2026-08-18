@@ -1,0 +1,415 @@
+---
+# This playbook applies configurations dynamically sent from the AE3GIS frontend
+
+- name: Configure Web Servers (Nginx)
+  hosts: web_servers
+  gather_facts: false
+  tasks:
+    - name: Configure Nginx domain, port, autoindex, and custom HTML
+      ansible.builtin.raw: |
+        DOMAIN="{{ domain_name | default('') }}"
+        HTML_CONTENT="{{ index_html | default('') }}"
+        PORT="{{ nginx_port | default('') }}"
+        AUTOINDEX="{{ nginx_autoindex | default('') }}"
+
+        # Native Bash defaults perfectly aligned with UI placeholders
+        if [ -z "$DOMAIN" ]; then DOMAIN="example.com"; fi
+        if [ -z "$HTML_CONTENT" ]; then HTML_CONTENT="<h1>Welcome to the web server!</h1>"; fi
+        if [ -z "$PORT" ]; then PORT="80"; fi
+        if [ -z "$AUTOINDEX" ]; then AUTOINDEX="off"; fi
+
+        # 1. Create all possible web roots just to be safe
+        mkdir -p /usr/share/nginx/html /var/www/html /usr/local/apache2/htdocs
+
+        # 2. Write the custom index.html
+        cat <<EOF > /tmp/index.html
+        $HTML_CONTENT
+        EOF
+        cat /tmp/index.html | tee /usr/share/nginx/html/index.html /var/www/html/index.html /usr/local/apache2/htdocs/index.html > /dev/null
+
+        # 3. Enforce strict permissions and ownership so Nginx doesn't throw 403s
+        chmod -R 755 /usr/share/nginx/html /var/www/html /usr/local/apache2/htdocs
+        chmod 644 /usr/share/nginx/html/index.html /var/www/html/index.html /usr/local/apache2/htdocs/index.html 2>/dev/null || true
+        chown -R www-data:www-data /var/www/html 2>/dev/null || true
+        chown -R nginx:nginx /usr/share/nginx/html 2>/dev/null || true
+
+        # 4. Build the Nginx configuration file safely
+        cat << 'EOF' > /tmp/custom_nginx.conf
+        server {
+            listen PORT_PLACEHOLDER;
+            server_name DOMAIN_PLACEHOLDER;
+
+            location / {
+                root /var/www/html;
+                index index.html index.htm;
+                autoindex AUTOINDEX_PLACEHOLDER;
+            }
+        }
+        EOF
+
+        # 5. Inject the variables safely to avoid parser crashes
+        sed -i "s|DOMAIN_PLACEHOLDER|$DOMAIN|g" /tmp/custom_nginx.conf
+        sed -i "s|PORT_PLACEHOLDER|$PORT|g" /tmp/custom_nginx.conf
+        sed -i "s|AUTOINDEX_PLACEHOLDER|$AUTOINDEX|g" /tmp/custom_nginx.conf
+
+        # 6. Apply the config to ALL of Nginx's potential config structures
+        rm -f /etc/nginx/sites-enabled/default
+        mkdir -p /etc/nginx/conf.d /etc/nginx/sites-enabled /etc/nginx/sites-available
+        
+        cp /tmp/custom_nginx.conf /etc/nginx/conf.d/custom_site.conf 2>/dev/null || true
+        cp /tmp/custom_nginx.conf /etc/nginx/sites-available/custom_site.conf 2>/dev/null || true
+        ln -sf /etc/nginx/sites-available/custom_site.conf /etc/nginx/sites-enabled/custom_site.conf 2>/dev/null || true
+
+        # 7. Reload the Nginx daemon to instantly apply changes
+        nginx -s reload || true
+  
+- name: Configure Directory Servers
+  hosts: directory_servers
+  gather_facts: false
+  tasks:
+    - name: Wipe default config, generate new OpenLDAP database, and populate users
+      ansible.builtin.raw: |
+        DOMAIN="{{ ldap_domain | default('dc=ae3gis,dc=local') }}"
+        ADMIN_PW="{{ ldap_admin_pw | default('admin') }}"
+        GROUPS="{{ ldap_groups | default('admins,users') }}"
+        USERS="{{ ldap_users | default('admin') }}"
+
+        pkill slapd || true
+        rm -rf /var/lib/ldap/* /etc/ldap/slapd.d/*
+        mkdir -p /etc/ldap/slapd.d /var/lib/ldap /var/run/slapd
+        chown -R openldap:openldap /var/run/slapd
+
+        cat << 'EOF' > /tmp/slapd.conf
+        include /etc/ldap/schema/core.schema
+        include /etc/ldap/schema/cosine.schema
+        include /etc/ldap/schema/nis.schema
+        include /etc/ldap/schema/inetorgperson.schema
+        
+        # Load the MDB database module for Ubuntu
+        modulepath /usr/lib/ldap
+        moduleload back_mdb
+        
+        pidfile /var/run/slapd/slapd.pid
+        argsfile /var/run/slapd/slapd.args
+        
+        database mdb
+        maxsize 1073741824
+        suffix "DC_PLACEHOLDER"
+        rootdn "cn=admin,DC_PLACEHOLDER"
+        rootpw ADMIN_PW_PLACEHOLDER
+        directory /var/lib/ldap
+        index objectClass eq
+        index uid eq
+        EOF
+
+        sed -i "s|DC_PLACEHOLDER|$DOMAIN|g" /tmp/slapd.conf
+        sed -i "s|ADMIN_PW_PLACEHOLDER|$ADMIN_PW|g" /tmp/slapd.conf
+
+        slaptest -f /tmp/slapd.conf -F /etc/ldap/slapd.d
+        chown -R openldap:openldap /etc/ldap/slapd.d /var/lib/ldap
+
+        /usr/sbin/slapd -h "ldap:/// ldapi:///" -u openldap -g openldap
+        sleep 3
+
+        FIRST_DC=$(echo "$DOMAIN" | sed -n 's/^dc=\([^,]*\).*/\1/p')
+        cat << EOF > /tmp/base.ldif
+        dn: $DOMAIN
+        objectClass: top
+        objectClass: dcObject
+        objectClass: organization
+        o: $FIRST_DC
+        dc: $FIRST_DC
+        EOF
+        ldapadd -x -D "cn=admin,$DOMAIN" -w "$ADMIN_PW" -f /tmp/base.ldif
+
+        cat << EOF > /tmp/setup.ldif
+        dn: ou=People,$DOMAIN
+        objectClass: organizationalUnit
+        ou: People
+
+        dn: ou=Groups,$DOMAIN
+        objectClass: organizationalUnit
+        ou: Groups
+        EOF
+
+        GID=5000
+        oldIFS=$IFS
+        IFS=','
+        for GRP in $GROUPS; do
+            GRP=$(echo "$GRP" | xargs)
+            if [ -n "$GRP" ]; then
+                cat << EOF >> /tmp/setup.ldif
+
+        dn: cn=$GRP,ou=Groups,$DOMAIN
+        objectClass: posixGroup
+        cn: $GRP
+        gidNumber: $GID
+        EOF
+                GID=$((GID+1))
+            fi
+        done
+        IFS=$oldIFS
+
+        UID_NUM=10000
+        oldIFS=$IFS
+        IFS=','
+        for USR in $USERS; do
+            USR=$(echo "$USR" | xargs)
+            if [ -n "$USR" ]; then
+                cat << EOF >> /tmp/setup.ldif
+
+        dn: uid=$USR,ou=People,$DOMAIN
+        objectClass: inetOrgPerson
+        objectClass: posixAccount
+        uid: $USR
+        sn: $USR
+        cn: $USR
+        uidNumber: $UID_NUM
+        gidNumber: 5000
+        homeDirectory: /home/$USR
+        loginShell: /bin/bash
+        userPassword: password123
+        EOF
+                UID_NUM=$((UID_NUM+1))
+            fi
+        done
+        IFS=$oldIFS
+
+        ldapadd -x -D "cn=admin,$DOMAIN" -w "$ADMIN_PW" -f /tmp/setup.ldif
+
+- name: Configure File Servers (Samba)
+  hosts: file_servers
+  gather_facts: false
+  tasks:
+    - name: Generate smb.conf, provision users, and reload daemon
+      ansible.builtin.raw: |
+        SHARE_NAME="{{ samba_share_name | default('') }}"
+        SHARE_PATH="{{ samba_share_path | default('') }}"
+        GUEST_OK="{{ samba_guest_ok | default('') }}"
+        READ_ONLY="{{ samba_read_only | default('') }}"
+        USERS="{{ samba_users | default('') }}"
+        SMB_PASS="{{ samba_pass | default('') }}"
+
+        # Use standard IF statements to handle empty strings to avoid confusing Ansible's parser
+        if [ -z "$SHARE_NAME" ]; then SHARE_NAME="public"; fi
+        if [ -z "$SHARE_PATH" ]; then SHARE_PATH="/srv/samba/public"; fi
+        if [ -z "$GUEST_OK" ]; then GUEST_OK="yes"; fi
+        if [ -z "$READ_ONLY" ]; then READ_ONLY="no"; fi
+        if [ -z "$SMB_PASS" ]; then SMB_PASS="password123"; fi
+
+        # 1. Create the share directory and explicitly assign ownership to the guest account
+        mkdir -p "$SHARE_PATH"
+        chown -R nobody:nogroup "$SHARE_PATH"
+        chmod -R 777 "$SHARE_PATH"
+
+        # 2. Build the valid users string and provision Linux/Samba users cleanly
+        VALID_USERS_LINE=""
+        if [ -n "$USERS" ]; then
+            oldIFS=$IFS
+            IFS=','
+            for USR in $USERS; do
+                USR=$(echo "$USR" | xargs)
+                if [ -n "$USR" ]; then
+                    # Create Linux user if they don't exist yet (POSIX compliant redirect)
+                    id -u "$USR" >/dev/null 2>&1 || useradd -M -s /usr/sbin/nologin "$USR"
+                    
+                    # Set their Samba password
+                    (echo "$SMB_PASS"; echo "$SMB_PASS") | smbpasswd -a -s "$USR"
+                    
+                    # Add them to our running string
+                    if [ -z "$VALID_USERS_LINE" ]; then
+                        VALID_USERS_LINE="$USR"
+                    else
+                        VALID_USERS_LINE="$VALID_USERS_LINE, $USR"
+                    fi
+                fi
+            done
+            IFS=$oldIFS
+        fi
+
+        # 3. Write a clean, baseline smb.conf using a safely quoted heredoc
+        cat << 'EOF' > /etc/samba/smb.conf
+        [global]
+           server role = standalone server
+           security = user
+           map to guest = bad user
+           guest account = nobody
+
+        [SHARE_NAME_PLACEHOLDER]
+           path = SHARE_PATH_PLACEHOLDER
+           browsable = yes
+           guest ok = GUEST_OK_PLACEHOLDER
+           read only = READ_ONLY_PLACEHOLDER
+           create mask = 0666
+           directory mask = 0777
+           force user = nobody
+        EOF
+
+        # 4. Safely inject variables into the config file using sed
+        sed -i "s|SHARE_NAME_PLACEHOLDER|$SHARE_NAME|g" /etc/samba/smb.conf
+        sed -i "s|SHARE_PATH_PLACEHOLDER|$SHARE_PATH|g" /etc/samba/smb.conf
+        sed -i "s|GUEST_OK_PLACEHOLDER|$GUEST_OK|g" /etc/samba/smb.conf
+        sed -i "s|READ_ONLY_PLACEHOLDER|$READ_ONLY|g" /etc/samba/smb.conf
+
+        # 5. Handle Users and Guest Access logic safely
+        if [ -n "$VALID_USERS_LINE" ]; then
+            if [ "$GUEST_OK" = "yes" ]; then
+                # Guest is allowed, so explicitly add 'nobody' to the whitelist!
+                echo "   valid users = $VALID_USERS_LINE, nobody" >> /etc/samba/smb.conf
+            else
+                # Strictly lock down to authenticated users
+                echo "   valid users = $VALID_USERS_LINE" >> /etc/samba/smb.conf
+            fi
+        fi
+
+        # 6. Force the foreground smbd process to reload the snew configuration
+        smbcontrol all reload-config || true
+        killall -HUP smbd || true
+
+- name: Configure Honeypots (OpenCanary)
+  hosts: honeypots
+  gather_facts: false
+  tasks:
+    - name: Dynamically rewrite opencanary.conf and restart daemon
+      ansible.builtin.raw: |
+        OC_FTP="{{ oc_ftp | default('') }}"
+        OC_HTTP="{{ oc_http | default('') }}"
+        OC_SSH="{{ oc_ssh | default('') }}"
+        OC_TELNET="{{ oc_telnet | default('') }}"
+        OC_SMB="{{ oc_smb | default('') }}"
+
+        # Native Bash defaults (fallback to enabled if UI sends empty strings)
+        if [ -z "$OC_FTP" ]; then OC_FTP="true"; fi
+        if [ -z "$OC_HTTP" ]; then OC_HTTP="true"; fi
+        if [ -z "$OC_SSH" ]; then OC_SSH="true"; fi
+        if [ -z "$OC_TELNET" ]; then OC_TELNET="true"; fi
+        if [ -z "$OC_SMB" ]; then OC_SMB="true"; fi
+
+        # 1. Safely parse and edit the JSON config using a Python script injection
+        cat << 'EOF' > /tmp/update_canary.py
+        import json
+        import sys
+
+        conf_path = '/etc/opencanaryd/opencanary.conf'
+        
+        with open(conf_path, 'r') as f:
+            data = json.load(f)
+
+        # Map the text arguments to proper JSON booleans
+        data['ftp.enabled'] = sys.argv[1] == 'true'
+        data['http.enabled'] = sys.argv[2] == 'true'
+        data['ssh.enabled'] = sys.argv[3] == 'true'
+        data['telnet.enabled'] = sys.argv[4] == 'true'
+        data['smb.enabled'] = sys.argv[5] == 'true'
+
+        with open(conf_path, 'w') as f:
+            json.dump(data, f, indent=4)
+        EOF
+
+        # 2. Execute the python script with our bash variables
+        python3 /tmp/update_canary.py "$OC_FTP" "$OC_HTTP" "$OC_SSH" "$OC_TELNET" "$OC_SMB"
+
+        # 3. Restart the background OpenCanary daemon to load the new config
+        opencanaryd --stop || true
+        opencanaryd --start
+
+- name: Configure Database Servers (PostgreSQL)
+  hosts: database_servers
+  gather_facts: false
+  tasks:
+    - name: Create Database, User, and Grant Permissions
+      ansible.builtin.raw: |
+        DB_NAME="{{ pg_db_name | default('') }}"
+        DB_USER="{{ pg_user | default('') }}"
+        DB_PASS="{{ pg_pass | default('') }}"
+
+        # Native Bash defaults in case the UI sends empty strings
+        if [ -z "$DB_NAME" ]; then DB_NAME="webapp_db"; fi
+        if [ -z "$DB_USER" ]; then DB_USER="dbadmin"; fi
+        if [ -z "$DB_PASS" ]; then DB_PASS="password123"; fi
+
+        # Smart wait: Pause until the PostgreSQL daemon is actually ready for connections
+        until pg_isready >/dev/null 2>&1; do
+            sleep 1
+        done
+
+        # Execute SQL commands natively as the postgres user
+        psql -c "CREATE DATABASE $DB_NAME;" || true
+        psql -c "CREATE USER $DB_USER WITH ENCRYPTED PASSWORD '$DB_PASS';" || true
+        
+        # Grant permissions to the new user
+        psql -c "GRANT ALL PRIVILEGES ON DATABASE $DB_NAME TO $DB_USER;" || true
+        psql -d "$DB_NAME" -c "GRANT ALL ON SCHEMA public TO $DB_USER;" || true
+
+- name: Configure Proxy Servers (Squid)
+  hosts: proxy_servers
+  gather_facts: false
+  tasks:
+    - name: Dynamically configure Squid Proxy, Blocklists, and Authentication
+      ansible.builtin.raw: |
+        SUBNETS="{{ squid_allowed_subnets | default('') }}"
+        AUTH_USER="{{ squid_auth_user | default('') }}"
+        AUTH_PASS="{{ squid_auth_pass | default('') }}"
+
+        # 1. Safely handle blocklists and clean invisible JSON characters
+        cat <<EOF > /tmp/blocked_domains.txt
+        {{ squid_blocked_domains | default('') }}
+        EOF
+        sed -i 's/\r//g' /tmp/blocked_domains.txt
+        sed -i 's/[, ]/\n/g' /tmp/blocked_domains.txt
+        sed -i '/^$/d' /tmp/blocked_domains.txt
+        cp /tmp/blocked_domains.txt /etc/squid/blocked_domains.txt
+
+        # 2. Start rebuilding squid.conf safely
+        cat <<EOF > /etc/squid/squid.conf
+        visible_hostname ae3gis-proxy
+        
+        acl SSL_ports port 443
+        acl Safe_ports port 80 443
+        acl CONNECT method CONNECT
+        http_access deny !Safe_ports
+        http_access deny CONNECT !SSL_ports
+        EOF
+
+        if [ -s /etc/squid/blocked_domains.txt ]; then
+            echo 'acl blocked_domains dstdomain "/etc/squid/blocked_domains.txt"' >> /etc/squid/squid.conf
+            echo 'http_access deny blocked_domains' >> /etc/squid/squid.conf
+        fi
+
+        # 3. Clean subnets of commas and carriage returns
+        CLEAN_SUBNETS=$(echo "$SUBNETS" | tr ',' ' ' | tr -d '\r\n')
+        if [ -z "$CLEAN_SUBNETS" ]; then CLEAN_SUBNETS="0.0.0.0/0"; fi
+        echo "acl allowed_subnets src $CLEAN_SUBNETS" >> /etc/squid/squid.conf
+
+        # 4. Auth & Access Rules using Native htpasswd
+        if [ -n "$AUTH_USER" ] && [ -n "$AUTH_PASS" ]; then
+            AUTH_HELPER=$(find /usr/lib/squid /usr/lib64/squid /usr/libexec/squid -name basic_ncsa_auth 2>/dev/null | head -n 1)
+            
+            # Verify both the NCSA helper and the htpasswd tool exist
+            if command -v htpasswd >/dev/null 2>&1 && [ -n "$AUTH_HELPER" ]; then
+                # Use htpasswd to securely generate the hash file (-b for batch mode, -c to create)
+                htpasswd -bc /etc/squid/passwords "$AUTH_USER" "$AUTH_PASS"
+                chmod 644 /etc/squid/passwords
+                
+                echo "auth_param basic program $AUTH_HELPER /etc/squid/passwords" >> /etc/squid/squid.conf
+                echo "acl authenticated proxy_auth REQUIRED" >> /etc/squid/squid.conf
+                echo "http_access allow allowed_subnets authenticated" >> /etc/squid/squid.conf
+            else
+                echo "http_access allow allowed_subnets" >> /etc/squid/squid.conf
+                echo "ERROR: Missing htpasswd or basic_ncsa_auth tool" > /tmp/squid_auth_error.log
+            fi
+        else
+            echo "http_access allow allowed_subnets" >> /etc/squid/squid.conf
+        fi
+
+        # 5. Lock down access and apply
+        echo "http_access deny all" >> /etc/squid/squid.conf
+        echo "http_port 3128" >> /etc/squid/squid.conf
+
+        # 6. Forcefully reload Squid bypassing the missing PID file
+        if command -v pkill >/dev/null 2>&1; then
+            pkill -HUP squid || true
+        else
+            kill -HUP $(pidof squid) 2>/dev/null || kill -HUP 1 2>/dev/null || true
+        fi
+        squid -k reconfigure 2>/dev/null || true

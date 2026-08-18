@@ -31,6 +31,7 @@ class Container(BaseModel):
     status: str | None = None  # "running" | "stopped" | "paused" at runtime; loose for stored data
     metadata: dict | None = None
     persistencePaths: list[str] | None = None
+    config: dict | None = None
 
 
 class Connection(BaseModel):

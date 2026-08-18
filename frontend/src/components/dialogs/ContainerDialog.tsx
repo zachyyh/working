@@ -67,7 +67,7 @@ function ContainerDialogInner({ onClose, onSubmit, initial, subnetCidr, takenIps
   const [activeCategory, setActiveCategory] = useState<string | null>(null);
   const [activeTypeMenu, setActiveTypeMenu] = useState<string | null>(null);
 
-  const handleSubmit = (e: React.FormEvent) => {
+const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault();
     if (!name.trim()) return;
     if (!isValidIp(ip)) {
@@ -84,11 +84,31 @@ function ContainerDialogInner({ onClose, onSubmit, initial, subnetCidr, takenIps
       setIpError('IP already in use');
       return;
     }
+
+    // Extract the tag (the last word) if the user typed something like "postgres 1.0"
+    const rawImage = image.trim();
+    let extractedTag = rawImage ? rawImage.split(/\s+/).pop() || '' : '';
+
+    // THE FIX: If the tag is still empty (user left it blank), auto-assign the default
+    // tag from your menuHierarchy so the backend doesn't crash to Alpine.
+    if (!extractedTag) {
+      for (const category of Object.values(menuHierarchy)) {
+        if (category[type] && category[type].length > 0) {
+          extractedTag = category[type][0]; // Grabs the first valid tag (e.g., '1.0' or 'latest')
+          break;
+        }
+      }
+      // Absolute fallback just in case the menuHierarchy is missing the type
+      if (!extractedTag) {
+        extractedTag = 'latest';
+      }
+    }
+
     onSubmit({
       name: name.trim(),
       type,
       ip: ip.trim(),
-      image: image.trim(),
+      image: extractedTag,
       status,
       metadata,
       persistencePaths,

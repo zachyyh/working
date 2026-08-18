@@ -12,6 +12,8 @@ import os
 import time
 from dataclasses import dataclass
 
+from services import ansible_manager
+
 log = logging.getLogger(__name__)
 
 # ── Config ────────────────────────────────────────────────────────

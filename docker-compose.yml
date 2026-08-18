@@ -2,8 +2,6 @@ services:
   frontend:
     build:
       context: ./frontend
-      no_cache: true
-    pull_policy: build
     ports:
       - "3000:80"
     extra_hosts:

@@ -91,6 +91,7 @@ def getRepoNames():
 
 repos, tags = getRepoNames()
 
+
 def image_for_container_type(ctype: str) -> str:
     if ctype == "router":
         return "uiaegisv3/router"
@@ -100,9 +101,9 @@ def image_for_container_type(ctype: str) -> str:
         return "uiaegisv3/switch"
     if ctype == "web-server":
         return "uiaegisv3/nginx-webserver:1.0"
-    if ctype == "database":
+    if ctype == "database-server":
         return "uiaegisv3/debian-postgres:1.0"
-    if ctype == "directory":
+    if ctype == "directory-server":
         return "uiaegisv3/ubuntu-openldap"
     if ctype == "ids":
         return "uiaegisv3/ids"
@@ -116,32 +117,43 @@ def image_for_container_type(ctype: str) -> str:
         return "uiaegisv3/tcp-pcap"
     if ctype == "proxy":
         return "uiaegisv3/seproxy"
-    if ctype == "internal-dns":
+    if ctype == "internal-dns-server" or ctype == "internaldns-server":
         return "uiaegisv3/internaldns"
-    if ctype == "external-dns":
+    if ctype == "external-dns-server" or ctype == "externaldns-server":
         return "uiaegisv3/externaldns"
-    if ctype == "dhcp":
+    if ctype == "dhcp-server":
         return "uiaegisv3/dhcpserv"
     if ctype == "plc":
         return "uiaegisv3/plc" 
     if ctype == "hmi":
         return "uiaegisv3/hmi"
+    if ctype == "file-server":
+        return "uiaegisv3/ubuntu-samba"
+    if ctype == "honeypot":
+        return "uiaegisv3/honeypot-opencanary"
     return _IMAGE_HOST
 
 
 def resolve_container_image(container: dict | None = None, ctype: str | None = None) -> str:
     """Return the explicit container image when provided, else the type default."""
+    tag = ""
     if container:
         if ctype is None:
             ctype = str(container.get("type") or "").strip()
         tag = str(container.get("image") or "").strip()
+        
     repo_name = repos.get(ctype)
     if not repo_name:
         return image_for_container_type((ctype or "").strip())
-    if tag == "" or not repo_name or tag not in tags:
+        
+    # Get the specific list of valid tags for this container type
+    valid_tags = tags.get(ctype, [])
+    
+    # Check if the requested tag exists in that list
+    if tag == "" or not repo_name or tag not in valid_tags:
         return image_for_container_type((ctype or "").strip())
     else:
-        return DOCKERHUB_USER+"/"+repo_name+":"+tag
+        return f"{DOCKERHUB_USER}/{repo_name}:{tag}"
 
 
 def get_script_bind(ctype: str) -> str | None:
@@ -602,16 +614,46 @@ def generate_clab_yaml(topology: dict, topology_id: str | None = None) -> str:
                         exec_cmds.append(f"ip route replace default via {gateway}")
 
                 elif ctype in _ROUTER_TYPES:
-                    # FRR router: enable forwarding, assign IPs on all interfaces,
-                    # then add static routes to every reachable remote subnet.
-                    exec_cmds.append("sysctl -w net.ipv4.ip_forward=1")
-                    for iface in ifaces:
-                        key = (cid, iface)
-                        if key in iface_ips:
-                            r_ip, r_pfx = iface_ips[key]
-                            exec_cmds.append(f"ip addr add {r_ip}/{r_pfx} dev {iface}")
-                    for dest_cidr, via_ip in router_static_routes.get(cid, []):
-                        exec_cmds.append(f"ip route add {dest_cidr} via {via_ip}")
+                    if ctype == "firewall":
+                        # ── VyOS Firewall Native Configuration ──
+                        exec_cmds.append("sh -c 'echo \"#!/bin/vbash\" > /tmp/fw_config.sh'")
+                        
+                        # Wait for the VyOS configuration system to finish booting before sending commands
+                        exec_cmds.append("sh -c 'echo \"while ! systemctl is-active vyos-router.service >/dev/null 2>&1; do sleep 2; done; sleep 3\" >> /tmp/fw_config.sh'")
+                        
+                        exec_cmds.append("sh -c 'echo \"source /opt/vyatta/etc/functions/script-template\" >> /tmp/fw_config.sh'")
+                        exec_cmds.append("sh -c 'echo \"configure\" >> /tmp/fw_config.sh'")
+                        
+                        # Configure Interface IPs
+                        for iface in ifaces:
+                            key = (cid, iface)
+                            if key in iface_ips:
+                                r_ip, r_pfx = iface_ips[key]
+                                exec_cmds.append(f"sh -c 'echo \"set interfaces ethernet {iface} address {r_ip}/{r_pfx}\" >> /tmp/fw_config.sh'")
+                        
+                        # Configure Static Routing
+                        for dest_cidr, via_ip in router_static_routes.get(cid, []):
+                            exec_cmds.append(f"sh -c 'echo \"set protocols static route {dest_cidr} next-hop {via_ip}\" >> /tmp/fw_config.sh'")
+                            
+                        # Commit and Save
+                        exec_cmds.append("sh -c 'echo \"commit\" >> /tmp/fw_config.sh'")
+                        exec_cmds.append("sh -c 'echo \"save\" >> /tmp/fw_config.sh'")
+                        exec_cmds.append("sh -c 'echo \"exit\" >> /tmp/fw_config.sh'")
+                        
+                        # Make executable and run as the vyos user
+                        exec_cmds.append("chmod +x /tmp/fw_config.sh")
+                        exec_cmds.append("su - vyos -c /tmp/fw_config.sh")
+                        
+                    else:
+                        # ── Standard FRR Router Configuration ──
+                        exec_cmds.append("sysctl -w net.ipv4.ip_forward=1")
+                        for iface in ifaces:
+                            key = (cid, iface)
+                            if key in iface_ips:
+                                r_ip, r_pfx = iface_ips[key]
+                                exec_cmds.append(f"ip addr add {r_ip}/{r_pfx} dev {iface}")
+                        for dest_cidr, via_ip in router_static_routes.get(cid, []):
+                            exec_cmds.append(f"ip route add {dest_cidr} via {via_ip}")
 
                 else:
                     # Host (workstation / web-server / plc / etc.): assign IP on
@@ -629,11 +671,24 @@ def generate_clab_yaml(topology: dict, topology_id: str | None = None) -> str:
 
                 node_cfg: dict = {"kind": "linux", "image": resolve_container_image(container, ctype)}
 
+                node_cfg["env"] = {"container": "docker"}
                 if container.get("metadata", None) is not None:
-                    node_cfg["env"] = container.get("metadata", None)
+                    node_cfg["env"].update(container.get("metadata", None))
+
+                # Initialize binds array for ALL nodes so we can inject the anti-hijack mounts
+                binds: list[str] = []
+
+                # --- NUCLEAR FIX FOR TTY HIJACK ---
+                # Mask systemd getty services so VyOS cannot spawn a login prompt on the host's physical monitor.
+                if ctype == "firewall":
+                    binds.extend([
+                        "/dev/null:/lib/systemd/system/getty@.service:ro",
+                        "/dev/null:/lib/systemd/system/serial-getty@.service:ro",
+                        "/dev/null:/lib/systemd/system/console-getty.service:ro",
+                        "/dev/null:/lib/systemd/system/container-getty@.service:ro"
+                    ])
 
                 if topology_id:
-                    binds: list[str] = []
                     raw_persist = container.get("persistencePaths", []) or []
                     if raw_persist:
                         log.info("Container %s has persistencePaths: %s", cid, raw_persist)
@@ -646,16 +701,15 @@ def generate_clab_yaml(topology: dict, topology_id: str | None = None) -> str:
                         host_path.mkdir(parents=True, exist_ok=True)
                         binds.append(f"{host_path}:{container_path}")
                         log.info("Container %s: bind %s -> %s", cid, host_path, container_path)
-                    if binds:
-                        node_cfg["binds"] = binds
-                
-                # Add read-only script directory mount if available for this container type
+
+                # Handle read-only scripts directory
                 script_bind = get_script_bind(ctype)
                 if script_bind:
-                    if "binds" not in node_cfg:
-                        node_cfg["binds"] = []
-                    node_cfg["binds"].append(script_bind)
+                    binds.append(script_bind)
                     log.info("Container %s (%s): mounted scripts at %s", cid, ctype, script_bind.split(":")[1])
+
+                if binds:
+                    node_cfg["binds"] = binds
                 if exec_cmds:
                     node_cfg["exec"] = exec_cmds
                 nodes[cid] = node_cfg

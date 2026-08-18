@@ -23,7 +23,7 @@ from config import INSTRUCTOR_TOKEN
 from database import get_db
 from models import StudentSlot, Topology
 from schemas import FirewallRulesResponse, FirewallRulesUpdate
-from services import capture_manager, clab_generator, clab_manager
+from services import capture_manager, clab_generator, clab_manager, ansible_manager
 from services.exec_session_manager import exec_session_manager
 
 log = logging.getLogger(__name__)
@@ -170,7 +170,12 @@ async def deploy(
         await clab_manager.pull_images(topo_data)
         await clab_manager.prepare_persistence_paths(topology_id, topo_data)
 
+        # 1. Start the ContainerLab deployment
         output = await clab_manager.deploy(topology_id)
+        
+        # 2. Run Ansible Config provisioning on the newly created containers
+        await ansible_manager.run_provisioning(topology_id, topo_data)
+
         topo.status = "deployed"
         db.commit()
         return {"status": "deployed", "output": output}
@@ -179,7 +184,6 @@ async def deploy(
         topo.status = "error"
         db.commit()
         raise HTTPException(500, f"{type(e).__name__}: {e}")
-
 
 # ── Destroy ─────────────────────────────────────────────────────────
 
